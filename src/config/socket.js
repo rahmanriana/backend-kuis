@@ -155,6 +155,24 @@ function setupSocketHandlers(io) {
           return;
         }
 
+        const game = getGameState(data.roomCode);
+        if (!game) {
+          socket.emit('error', { message: 'Game not found' });
+          return;
+        }
+
+        // Prevent selecting an occupied position
+        if (game.board[data.position] !== null) {
+          socket.emit('error', { message: 'Position already occupied' });
+          return;
+        }
+
+        // Prevent selecting when game not active
+        if (game.gameStatus !== 'active') {
+          socket.emit('error', { message: 'Game not active' });
+          return;
+        }
+
         const question = selectCell(data.roomCode, socket.id, data.position);
         if (!question) {
           socket.emit('error', { message: 'Failed to get question' });
@@ -205,6 +223,15 @@ function setupSocketHandlers(io) {
           socket.emit('answer-wrong', {
             livesLeft: result.livesLeft,
             nextTurn: result.nextTurn,
+            gameState: result.gameState
+          });
+        }
+
+        // If the submit advanced the round (draw or round winner), notify clients explicitly
+        if (result.roundAdvanced) {
+          console.log(`🔁 Round advanced to ${result.advancedToRound} in room ${data.roomCode}`);
+          io.to(data.roomCode).emit('round-advanced', {
+            round: result.advancedToRound,
             gameState: result.gameState
           });
         }

@@ -81,7 +81,14 @@ function submitAnswer(roomCode, playerSocketId, answer, position) {
       return { success: false, message: 'Not your turn' };
     }
 
-    const correct = game.checkAnswer(answer);
+    // Ensure answer is a number (socket may send strings)
+    const numericAnswer = Number(answer);
+    console.log(`Checking answer (raw: ${answer}, numeric: ${numericAnswer}) against correctIndex: ${game.currentQuestion?.correctAnswer}`);
+    const correct = game.checkAnswer(numericAnswer);
+
+    // Track whether this submit caused a round advancement (win or draw)
+    let roundAdvanced = false;
+    let advancedToRound = null;
 
     if (correct) {
       const points = game.round === 1 ? 10 : game.round === 2 ? 20 : 30;
@@ -98,6 +105,8 @@ function submitAnswer(roomCode, playerSocketId, answer, position) {
         // Advance to next round instead of ending game
         console.log(`=== ROUND ${game.round} WINNER: ${winner} - ADVANCING TO NEXT ROUND ===`);
         game.nextRound();
+        roundAdvanced = true;
+        advancedToRound = game.round;
         console.log(`=== NOW IN ROUND ${game.round} ===`);
         
         // Check if GAME is over (all 3 rounds done)
@@ -128,9 +137,11 @@ function submitAnswer(roomCode, playerSocketId, answer, position) {
       const isBoardFull = game.board.every(cell => cell !== null);
       console.log(`[ANSWER CORRECT] Board: [${game.board.join(',')}] Full: ${isBoardFull}, Round: ${game.round}`);
       
-      if (isBoardFull) {
+        if (isBoardFull) {
         console.log(`=== ROUND ${game.round} ENDED IN DRAW - ADVANCING TO NEXT ROUND ===`);
-        game.nextRound();
+          game.nextRound();
+          roundAdvanced = true;
+          advancedToRound = game.round;
         console.log(`=== NOW IN ROUND ${game.round} ===`);
         
         // Check if game is over after next round
@@ -147,8 +158,10 @@ function submitAnswer(roomCode, playerSocketId, answer, position) {
         }
       }
 
-      // Switch turn after everything is resolved
-      game.switchTurn();
+      // Switch turn after everything is resolved (if game still active)
+      if (game.gameStatus === 'active') {
+        game.switchTurn();
+      }
       console.log(`[ANSWER CORRECT] Turn switched to: ${game.currentTurn}, Now Round: ${game.round}`);
       
       return {
@@ -156,7 +169,9 @@ function submitAnswer(roomCode, playerSocketId, answer, position) {
         points,
         board: game.board,
         nextTurn: game.currentTurn,
-        gameState: game.getGameState()
+        gameState: game.getGameState(),
+        roundAdvanced,
+        advancedToRound
       };
     } else {
       const livesLeft = game.deductLife(playerSocketId);
@@ -180,7 +195,8 @@ function submitAnswer(roomCode, playerSocketId, answer, position) {
         correct: false,
         livesLeft,
         nextTurn: game.currentTurn,
-        gameState: game.getGameState()
+        gameState: game.getGameState(),
+        roundAdvanced: false
       };
     }
   } catch (error) {

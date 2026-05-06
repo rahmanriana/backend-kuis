@@ -55,12 +55,39 @@ class Game {
     const randomIndex = Math.floor(Math.random() * availableQuestions.length);
     const selectedQuestion = availableQuestions[randomIndex];
 
+    // Create a shuffled copy so the correct answer isn't always at a fixed index
+    const shuffledQuestion = {
+      ...selectedQuestion,
+      options: Array.isArray(selectedQuestion.options) ? [...selectedQuestion.options] : []
+    };
+
+    // Shuffle options while preserving which one is correct
+    // We shuffle (text, isCorrect) pairs then compute the new correctAnswer index.
+    const optionPairs = shuffledQuestion.options.map((text, index) => ({
+      text,
+      isCorrect: index === selectedQuestion.correctAnswer
+    }));
+
+    // Fisher-Yates shuffle
+    for (let i = optionPairs.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [optionPairs[i], optionPairs[j]] = [optionPairs[j], optionPairs[i]];
+    }
+
+    shuffledQuestion.options = optionPairs.map(p => p.text);
+    // Ensure correctAnswer is numeric and points to the new index of the correct option
+    const newCorrectIndex = optionPairs.findIndex(p => p.isCorrect);
+    shuffledQuestion.correctAnswer = typeof newCorrectIndex === 'number' ? newCorrectIndex : -1;
+
+    // Log shuffle for debugging (can be removed later)
+    console.log(`Shuffled question ${selectedQuestion.id}: options=[${shuffledQuestion.options.join('|')}], correctAnswerIndex=${shuffledQuestion.correctAnswer}`);
+
     // Mark as used
     this.usedQuestions.push(selectedQuestion.id);
-    this.currentQuestion = selectedQuestion;
+    this.currentQuestion = shuffledQuestion;
 
     console.log(`Selected question ${selectedQuestion.id} for round ${this.round}`);
-    return selectedQuestion;
+    return shuffledQuestion;
   }
 
   /**
