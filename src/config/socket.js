@@ -4,7 +4,8 @@ const {
   leaveRoom,
   getRoom,
   getRoomsList,
-  getAllRooms
+  getAllRooms,
+  rebindPlayerSocket
 } = require('../controllers/roomController');
 
 const {
@@ -13,8 +14,19 @@ const {
   submitAnswer,
   placeSymbol,
   getGameState,
-  endGame
+  endGame,
+  rebindGamePlayerSocket
 } = require('../controllers/gameController');
+
+const {
+  getOnlineUsers,
+  setUserOnline,
+  getUserById,
+  saveMessage
+} = require('../utils/userUtils');
+
+const activeUsers = new Map();
+const usernameToSocketId = new Map();
 
 /**
  * Setup Socket.IO event handlers
@@ -23,6 +35,246 @@ const {
 function setupSocketHandlers(io) {
   io.on('connection', (socket) => {
     console.log(`User connected: ${socket.id}`);
+
+    const broadcastOnlineUsers = async () => {
+      const users = await getOnlineUsers();
+      io.emit('online-users', users);
+    };
+
+    const updateUserStatus = async (userId, status) => {
+      await setUserOnline(userId, status);
+      await broadcastOnlineUsers();
+    };
+
+    socket.on('user-online', async (data) => {
+      try {
+        if (!data || !data.username) {
+          return;
+        }
+
+        const username = String(data.username).trim();
+
+        // Keep existing userId mapping (if provided) for backward compatibility.
+        if (data.userId) {
+          activeUsers.set(data.userId, {
+            socketId: socket.id,
+            userId: data.userId,
+            username
+          });
+        }
+
+        // Preferred mapping for targeted emits (invite, etc).
+        if (username) {
+          usernameToSocketId.set(username, socket.id);
+        }
+
+        if (data.userId) {
+          await updateUserStatus(data.userId, true);
+        } else {
+          await broadcastOnlineUsers();
+        }
+        socket.emit('online-users', await getOnlineUsers());
+      } catch (err) {
+        console.error('Error on user-online:', err);
+      }
+    });
+
+    socket.on('get-online-users', async () => {
+      try {
+        socket.emit('online-users', await getOnlineUsers());
+      } catch (err) {
+        console.error('Error on get-online-users:', err);
+      }
+    });
+
+    socket.on('user-offline', async (data) => {
+      try {
+        if (!data || !data.userId) {
+          return;
+        }
+
+        const userData = activeUsers.get(data.userId);
+        if (userData?.username) {
+          usernameToSocketId.delete(userData.username);
+        }
+        activeUsers.delete(data.userId);
+        await updateUserStatus(data.userId, false);
+      } catch (err) {
+        console.error('Error on user-offline:', err);
+      }
+    });
+
+    socket.on('invite-player', async (payload) => {
+      try {
+        if (!payload || !payload.fromUsername) {
+          socket.emit('error', { message: 'Invalid invite payload' });
+          return;
+        }
+
+        const toUsername = payload.toUsername ? String(payload.toUsername).trim() : '';
+        const target = payload.toUserId ? activeUsers.get(payload.toUserId) : null;
+        const targetSocketId = target?.socketId || (toUsername ? usernameToSocketId.get(toUsername) : null);
+
+        if (!targetSocketId) {
+          socket.emit('error', { message: 'Target player is not online' });
+          return;
+        }
+
+        // Guard against wrong client payload / stale mapping (prevents sender seeing own invite popup).
+        if (targetSocketId === socket.id) {
+          socket.emit('error', { message: 'Tidak bisa mengundang diri sendiri' });
+          return;
+        }
+
+        io.to(targetSocketId).emit('receive-invite', {
+          fromUserId: payload.fromUserId,
+          fromUsername: payload.fromUsername,
+          toUserId: payload.toUserId,
+          toUsername: payload.toUsername,
+          roomCode: payload.roomCode || null
+        });
+      } catch (err) {
+        console.error('Error on invite-player:', err);
+        socket.emit('error', { message: 'Internal server error' });
+      }
+    });
+
+    socket.on('accept-invite', async (payload) => {
+      try {
+        if (!payload || !payload.fromUserId || !payload.toUserId) {
+          socket.emit('error', { message: 'Invalid accept payload' });
+          return;
+        }
+
+        const inviter = activeUsers.get(payload.fromUserId);
+        const acceptor = activeUsers.get(payload.toUserId);
+        if (!inviter || !acceptor) {
+          socket.emit('error', { message: 'Both players must be online to accept invite' });
+          return;
+        }
+
+        const inviterUser = await getUserById(payload.fromUserId);
+        const acceptorUser = await getUserById(payload.toUserId);
+        if (!inviterUser || !acceptorUser) {
+          socket.emit('error', { message: 'User not found' });
+          return;
+        }
+
+        // Host should remain the inviter (the player who sent the invite),
+        // so lobby theme selection + start-game permissions are correct.
+        const createResult = createRoom('umum', inviter.socketId, inviterUser.username);
+        const roomCode = createResult.roomCode;
+        const joinResult = joinRoom(roomCode, acceptor.socketId, acceptorUser.username);
+        if (!joinResult.success) {
+          socket.emit('error', { message: joinResult.message });
+          return;
+        }
+
+        // Make sure both sockets actually join the Socket.IO room
+        // so room-only events (chat/game) work after invite accept.
+        const inviterSocket = io.sockets.sockets.get(inviter.socketId);
+        const acceptorSocket = io.sockets.sockets.get(acceptor.socketId);
+        inviterSocket?.join(roomCode);
+        acceptorSocket?.join(roomCode);
+
+        const finalRoom = joinResult.room.toJSON();
+
+        // Both should receive the same final room state (already includes 2 players).
+        // Use room-joined so clients can navigate to the waiting room lobby immediately.
+        io.to(inviter.socketId).emit('room-joined', { roomCode, room: finalRoom });
+        io.to(acceptor.socketId).emit('room-joined', { roomCode, room: finalRoom });
+
+        // Also broadcast room-updated to the Socket.IO room channel (for realtime lobby UI)
+        io.to(roomCode).emit('room-updated', { roomCode, room: finalRoom });
+
+        io.emit('room-list-updated', getRoomsList());
+      } catch (err) {
+        console.error('Error on accept-invite:', err);
+        socket.emit('error', { message: 'Internal server error' });
+      }
+    });
+
+    socket.on('reject-invite', async (payload) => {
+      try {
+        if (!payload || !payload.fromUserId || !payload.toUserId) {
+          return;
+        }
+        const inviter = activeUsers.get(payload.fromUserId);
+        if (inviter) {
+          io.to(inviter.socketId).emit('invite-rejected', {
+            fromUserId: payload.fromUserId,
+            toUserId: payload.toUserId,
+            toUsername: payload.toUsername || null
+          });
+        }
+      } catch (err) {
+        console.error('Error on reject-invite:', err);
+      }
+    });
+
+    socket.on('send-message', async (data) => {
+      try {
+        if (!data || !data.roomCode || !data.sender_username || !data.message) {
+          socket.emit('error', { message: 'Invalid message payload' });
+          return;
+        }
+
+        await saveMessage(data.roomCode, data.sender_username, data.message);
+        io.to(data.roomCode).emit('receive-message', {
+          roomCode: data.roomCode,
+          sender_username: data.sender_username,
+          message: data.message,
+          created_at: new Date().toISOString()
+        });
+      } catch (err) {
+        console.error('Error on send-message:', err);
+        socket.emit('error', { message: 'Internal server error' });
+      }
+    });
+
+    // Refresh/reconnect support: rejoin a room and rebind socketId (so room-only emits are realtime again).
+    socket.on('rejoin-room', (data) => {
+      try {
+        if (!data || !data.roomCode || !data.playerName) {
+          socket.emit('error', { message: 'Room code and player name are required' });
+          return;
+        }
+
+        const room = getRoom(data.roomCode);
+        if (!room) {
+          socket.emit('error', { message: 'Room not found' });
+          return;
+        }
+
+        const bindResult = rebindPlayerSocket(data.roomCode, data.playerName, socket.id);
+        if (!bindResult.success) {
+          socket.emit('error', { message: bindResult.message || 'Failed to rejoin room' });
+          return;
+        }
+
+        socket.join(data.roomCode);
+
+        // Notify room that room meta changed (socketId possibly changed)
+        io.to(data.roomCode).emit('room-updated', {
+          roomCode: data.roomCode,
+          room: bindResult.room.toJSON()
+        });
+
+        // If a game is active, rebind socketId inside game state too and sync the rejoined client
+        const game = getGameState(data.roomCode);
+        if (game) {
+          const gameBind = rebindGamePlayerSocket(data.roomCode, data.playerName, socket.id, bindResult.oldSocketId);
+          if (gameBind.success) {
+            socket.emit('game-updated', gameBind.gameState);
+          }
+        }
+
+        socket.emit('rejoin-success', { roomCode: data.roomCode });
+      } catch (error) {
+        console.error('Error on rejoin-room:', error);
+        socket.emit('error', { message: 'Internal server error' });
+      }
+    });
 
     // LOBBY EVENTS
     socket.on('create-room', (data) => {
@@ -36,10 +288,9 @@ function setupSocketHandlers(io) {
         const result = createRoom(theme, socket.id, playerName);
 
         socket.join(result.roomCode);
-        socket.emit('room-created', {
-          roomCode: result.roomCode,
-          room: result.room.toJSON()
-        });
+        const currentRoom = result.room.toJSON();
+        socket.emit('room-created', { roomCode: result.roomCode, room: currentRoom });
+        io.to(result.roomCode).emit('room-updated', { roomCode: result.roomCode, room: currentRoom });
 
         io.emit('room-list-updated', getRoomsList());
       } catch (error) {
@@ -64,14 +315,17 @@ function setupSocketHandlers(io) {
         }
 
         socket.join(roomCode);
-        socket.emit('room-joined', {
-          roomCode,
-          room: result.room.toJSON()
-        });
+        const currentRoom = result.room.toJSON();
+
+        socket.emit('room-joined', { roomCode, room: currentRoom });
 
         socket.to(roomCode).emit('player-joined', {
+          roomCode,
           player: result.room.getPlayer(socket.id)
         });
+
+        // Keep both clients in sync with the full room state
+        io.to(roomCode).emit('room-updated', { roomCode, room: currentRoom });
 
         io.emit('room-list-updated', getRoomsList());
       } catch (error) {
@@ -92,11 +346,52 @@ function setupSocketHandlers(io) {
 
         if (removedPlayer) {
           socket.leave(roomCode);
-          socket.to(roomCode).emit('player-left', { player: removedPlayer });
+          socket.to(roomCode).emit('player-left', { roomCode, player: removedPlayer });
+          const room = getRoom(roomCode);
+          if (room) {
+            io.to(roomCode).emit('room-updated', { roomCode, room: room.toJSON() });
+          }
           io.emit('room-list-updated', getRoomsList());
         }
       } catch (error) {
         console.error('Error leaving room:', error);
+        socket.emit('error', { message: 'Internal server error' });
+      }
+    });
+
+    // Lobby-only: host can change theme before game starts
+    socket.on('set-room-theme', (data) => {
+      try {
+        if (!data || !data.roomCode || !data.theme) {
+          socket.emit('error', { message: 'Room code and theme are required' });
+          return;
+        }
+
+        const room = getRoom(data.roomCode);
+        if (!room) {
+          socket.emit('error', { message: 'Room not found' });
+          return;
+        }
+
+        if (room.status !== 'waiting') {
+          socket.emit('error', { message: 'Game already started' });
+          return;
+        }
+
+        if (room.host !== socket.id) {
+          socket.emit('error', { message: 'Only host can change theme' });
+          return;
+        }
+
+        room.theme = String(data.theme).toLowerCase();
+
+        io.to(data.roomCode).emit('room-updated', {
+          roomCode: data.roomCode,
+          room: room.toJSON()
+        });
+        io.emit('room-list-updated', getRoomsList());
+      } catch (error) {
+        console.error('Error setting room theme:', error);
         socket.emit('error', { message: 'Internal server error' });
       }
     });
@@ -318,10 +613,22 @@ function setupSocketHandlers(io) {
       }
     });
 
-    socket.on('disconnect', () => {
+    socket.on('disconnect', async () => {
       console.log(`User disconnected: ${socket.id}`);
 
       try {
+        for (const [userId, userData] of activeUsers) {
+          if (userData.socketId === socket.id) {
+            if (userData.username) {
+              usernameToSocketId.delete(userData.username);
+            }
+            activeUsers.delete(userId);
+            await setUserOnline(userId, false);
+            io.emit('online-users', await getOnlineUsers());
+            break;
+          }
+        }
+
         for (const [roomCode, room] of getAllRooms()) {
           if (room.getPlayer(socket.id)) {
             const removedPlayer = leaveRoom(roomCode, socket.id);

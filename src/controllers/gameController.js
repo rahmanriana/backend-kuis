@@ -338,6 +338,46 @@ function getAllGames() {
   return games;
 }
 
+/**
+ * Rebind a player's socketId inside an active game (refresh/reconnect support).
+ * Does not change gameplay rules; only updates identifiers so realtime stays working.
+ * @param {string} roomCode
+ * @param {string} playerName
+ * @param {string} newSocketId
+ * @param {string} [oldSocketId]
+ * @returns {{success: boolean, gameState?: object, message?: string}}
+ */
+function rebindGamePlayerSocket(roomCode, playerName, newSocketId, oldSocketId) {
+  try {
+    const game = games.get(roomCode);
+    if (!game) {
+      return { success: false, message: 'Game not found' };
+    }
+
+    const cleanName = String(playerName || '').trim();
+    if (!cleanName) {
+      return { success: false, message: 'Player name is required' };
+    }
+
+    const player = game.players.find((p) => p.name === cleanName);
+    if (!player) {
+      return { success: false, message: 'Player not in game' };
+    }
+
+    const previousSocketId = oldSocketId || player.socketId;
+    player.socketId = newSocketId;
+
+    if (game.currentTurn === previousSocketId) {
+      game.currentTurn = newSocketId;
+    }
+
+    return { success: true, gameState: game.getGameState() };
+  } catch (error) {
+    console.error('Error rebinding game player socket:', error);
+    return { success: false, message: 'Internal server error' };
+  }
+}
+
 module.exports = {
   startGame,
   getQuestion,
@@ -347,5 +387,6 @@ module.exports = {
   getGameState,
   endGame,
   deleteGame,
-  getAllGames
+  getAllGames,
+  rebindGamePlayerSocket
 };

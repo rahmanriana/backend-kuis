@@ -124,6 +124,46 @@ function getRoom(roomCode) {
 }
 
 /**
+ * Rebind a player socketId by player name (for refresh/reconnect support).
+ * Keeps room host stable by moving host socketId when needed.
+ * @param {string} roomCode
+ * @param {string} playerName
+ * @param {string} newSocketId
+ * @returns {{success: boolean, room?: any, oldSocketId?: string, message?: string}}
+ */
+function rebindPlayerSocket(roomCode, playerName, newSocketId) {
+  try {
+    const room = rooms.get(roomCode);
+    if (!room) {
+      return { success: false, message: 'Room not found' };
+    }
+
+    const cleanName = String(playerName || '').trim();
+    if (!cleanName) {
+      return { success: false, message: 'Player name is required' };
+    }
+
+    const existing = room.players.find((p) => p.name === cleanName);
+    if (!existing) {
+      return { success: false, message: 'Player not in room' };
+    }
+
+    const oldSocketId = existing.socketId;
+    existing.socketId = newSocketId;
+
+    // If this player was host, move host socketId too.
+    if (room.host === oldSocketId) {
+      room.host = newSocketId;
+    }
+
+    return { success: true, room, oldSocketId };
+  } catch (error) {
+    console.error('Error rebinding player socket:', error);
+    return { success: false, message: 'Internal server error' };
+  }
+}
+
+/**
  * Delete room
  * @param {string} roomCode - Room code to delete
  */
@@ -169,5 +209,6 @@ module.exports = {
   getRoom,
   deleteRoom,
   getRoomsList,
-  getAllRooms
+  getAllRooms,
+  rebindPlayerSocket
 };

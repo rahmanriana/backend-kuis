@@ -4,7 +4,7 @@ const socketIo = require('socket.io');
 require('dotenv').config();
 
 const app = require('./src/app');
-const { setupSocketHandlers } = require('./src/config/socket');
+const { setupSocketHandlers } = require('./socket/socketHandler');
 
 // Create HTTP server
 const server = http.createServer(app);
