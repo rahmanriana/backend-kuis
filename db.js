@@ -16,7 +16,8 @@ const pool = mysql.createPool({
   port: Number(process.env.DB_PORT || 3306),
   waitForConnections: true,
   connectionLimit: Number(process.env.DB_POOL_LIMIT || 10),
-  queueLimit: 0
+  queueLimit: 0,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: true } : undefined
 });
 
 async function dbQuery(sql, params = []) {
